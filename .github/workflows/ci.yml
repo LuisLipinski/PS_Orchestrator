@@ -35,3 +35,299 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build container
         run: docker build -t ps-orchestrator:ci .
+
+  onboarding-integration:
+    needs: [unit-tests, docker-build]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mailhog:
+        image: mailhog/mailhog:v1.0.1
+        ports:
+          - 1025:1025
+          - 8025:8025
+
+    env:
+      PGPASSWORD: postgres
+      INTERNAL_API_KEY: integration-internal-key
+      JWT_SECRET_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      ONBOARDING_ID: 55555555-5555-4555-8555-555555555555
+      USER_EMAIL: onboarding.integration@mypetadmin.test
+
+    steps:
+      - name: Checkout PS_Orchestrator
+        uses: actions/checkout@v5
+
+      - name: Checkout PS_Empresa master
+        uses: actions/checkout@v5
+        with:
+          repository: LuisLipinski/PS_Empresa
+          ref: master
+          path: ps-empresa
+
+      - name: Checkout PS_User master
+        uses: actions/checkout@v5
+        with:
+          repository: LuisLipinski/ps_user-login
+          ref: master
+          path: ps-user
+
+      - name: Checkout PS_Contrato master
+        uses: actions/checkout@v5
+        with:
+          repository: LuisLipinski/PS_Contrato
+          ref: master
+          path: ps-contrato
+
+      - name: Checkout PS_Login master
+        uses: actions/checkout@v5
+        with:
+          repository: LuisLipinski/Ps_login
+          ref: master
+          path: ps-login
+
+      - name: Setup Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Install integration dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client jq
+
+      - name: Prepare PostgreSQL databases
+        run: |
+          set -euo pipefail
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE ps_empresa_it;'
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE ps_user_it;'
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE ps_contrato_it;'
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE ps_login_it;'
+
+      - name: Build all services
+        run: |
+          set -euo pipefail
+          mvn -B -DskipTests package
+          (cd ps-empresa && mvn -B -DskipTests package)
+          (cd ps-user && mvn -B -DskipTests package)
+          (cd ps-contrato && mvn -B -DskipTests package)
+          (cd ps-login && mvn -B -DskipTests package)
+
+      - name: Start PS_Empresa
+        run: |
+          SPRING_PROFILES_ACTIVE=prod \
+          PORT=8081 \
+          DB_URL=jdbc:postgresql://localhost:5432/ps_empresa_it \
+          DB_USERNAME=postgres \
+          DB_PASSWORD=postgres \
+          INTERNAL_API_KEY="$INTERNAL_API_KEY" \
+          JWT_SECRET_KEY="$JWT_SECRET_KEY" \
+          nohup java -jar ps-empresa/target/*.jar > ps-empresa.log 2>&1 &
+          echo $! > ps-empresa.pid
+
+      - name: Start PS_User
+        run: |
+          SPRING_PROFILES_ACTIVE=prod \
+          PORT=8083 \
+          DB_URL=jdbc:postgresql://localhost:5432/ps_user_it \
+          DB_USERNAME=postgres \
+          DB_PASSWORD=postgres \
+          PS_EMPRESA_URL=http://localhost:8081 \
+          INTERNAL_API_KEY="$INTERNAL_API_KEY" \
+          nohup java -jar ps-user/target/*.jar > ps-user.log 2>&1 &
+          echo $! > ps-user.pid
+
+      - name: Start PS_Contrato
+        run: |
+          SPRING_PROFILES_ACTIVE=prod \
+          PORT=8082 \
+          DB_URL=jdbc:postgresql://localhost:5432/ps_contrato_it \
+          DB_USERNAME=postgres \
+          DB_PASSWORD=postgres \
+          PS_EMPRESA_URL=http://localhost:8081 \
+          INTERNAL_API_KEY="$INTERNAL_API_KEY" \
+          nohup java -jar ps-contrato/target/*.jar > ps-contrato.log 2>&1 &
+          echo $! > ps-contrato.pid
+
+      - name: Start PS_Login
+        run: |
+          SPRING_PROFILES_ACTIVE=prod \
+          PORT=8084 \
+          DB_URL=jdbc:postgresql://localhost:5432/ps_login_it \
+          DB_USERNAME=postgres \
+          DB_PASSWORD=postgres \
+          PS_USER_URL=http://localhost:8083 \
+          INTERNAL_API_KEY="$INTERNAL_API_KEY" \
+          JWT_SECRET_KEY="$JWT_SECRET_KEY" \
+          ACTIVATION_URL=http://activation.invalid/activate \
+          PASSWORD_RESET_URL=http://reset.invalid/reset \
+          MAIL_HOST=localhost \
+          MAIL_PORT=1025 \
+          MAIL_FROM=no-reply@mypetadmin.test \
+          MAIL_SMTP_AUTH=false \
+          MAIL_SMTP_STARTTLS=false \
+          nohup java -jar ps-login/target/*.jar > ps-login.log 2>&1 &
+          echo $! > ps-login.pid
+
+      - name: Start PS_Orchestrator
+        run: |
+          SPRING_PROFILES_ACTIVE=prod \
+          PORT=8085 \
+          PS_EMPRESA_URL=http://localhost:8081 \
+          PS_CONTRATO_URL=http://localhost:8082 \
+          PS_USER_URL=http://localhost:8083 \
+          PS_LOGIN_URL=http://localhost:8084 \
+          INTERNAL_API_KEY="$INTERNAL_API_KEY" \
+          nohup java -jar target/*.jar > ps-orchestrator.log 2>&1 &
+          echo $! > ps-orchestrator.pid
+
+      - name: Wait for all services
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if curl -fsS http://localhost:8081/actuator/health >/dev/null \
+              && curl -fsS http://localhost:8082/actuator/health >/dev/null \
+              && curl -fsS http://localhost:8083/actuator/health >/dev/null \
+              && curl -fsS http://localhost:8084/actuator/health >/dev/null \
+              && curl -fsS http://localhost:8085/actuator/health >/dev/null \
+              && curl -fsS http://localhost:8025/api/v2/messages >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'Services did not become healthy'
+          exit 1
+
+      - name: Execute initial onboarding
+        run: |
+          set -euo pipefail
+          cat > /tmp/onboarding.json <<JSON
+          {
+            "documentNumber": "17395568000151",
+            "razaoSocial": "My Pet Admin Integration LTDA",
+            "nomeFantasia": "My Pet Admin Integration",
+            "telefone": "41999999999",
+            "email": "$USER_EMAIL",
+            "nomeTitular": "Master Integration",
+            "rua": "Rua A",
+            "numero": "100",
+            "complemento": "Casa",
+            "bairro": "Centro",
+            "cidade": "Curitiba",
+            "estado": "PR",
+            "cep": "01010100"
+          }
+          JSON
+
+          STATUS=$(curl -sS -o /tmp/onboarding-first.json -w '%{http_code}' \
+            -X POST http://localhost:8085/internal/onboardings \
+            -H "X-Internal-Key: $INTERNAL_API_KEY" \
+            -H "X-Onboarding-Id: $ONBOARDING_ID" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/onboarding.json)
+          test "$STATUS" = "200"
+
+          EMPRESA_ID=$(jq -r '.empresaId' /tmp/onboarding-first.json)
+          MASTER_ID=$(jq -r '.masterUserId' /tmp/onboarding-first.json)
+          CONTRATO_ID=$(jq -r '.contratoId' /tmp/onboarding-first.json)
+          test -n "$EMPRESA_ID" && test "$EMPRESA_ID" != "null"
+          test -n "$MASTER_ID" && test "$MASTER_ID" != "null"
+          test -n "$CONTRATO_ID" && test "$CONTRATO_ID" != "null"
+          test "$(jq -r '.onboardingId' /tmp/onboarding-first.json)" = "$ONBOARDING_ID"
+          test "$(jq -r '.empresaStatus' /tmp/onboarding-first.json)" = "AGUARDANDO_CONTRATO"
+          test "$(jq -r '.contratoStatus' /tmp/onboarding-first.json)" = "AGUARDANDO_PAGAMENTO"
+          test "$(jq -r '.invitationStatus' /tmp/onboarding-first.json)" = "REQUESTED"
+
+          echo "EMPRESA_ID=$EMPRESA_ID" >> "$GITHUB_ENV"
+          echo "MASTER_ID=$MASTER_ID" >> "$GITHUB_ENV"
+          echo "CONTRATO_ID=$CONTRATO_ID" >> "$GITHUB_ENV"
+
+      - name: Validate durable checkpoints and one e-mail
+        run: |
+          set -euo pipefail
+          test "$(psql -h localhost -U postgres -d ps_empresa_it -Atc "SELECT count(*) FROM empresas WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_user_it -Atc "SELECT count(*) FROM usuarios WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_contrato_it -Atc "SELECT count(*) FROM contratos WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_login_it -Atc "SELECT count(*) FROM activation_tokens WHERE request_id='$ONBOARDING_ID'")" = "1"
+
+          for attempt in $(seq 1 20); do
+            MAIL_COUNT=$(curl -fsS 'http://localhost:8025/api/v2/messages?limit=50' | jq -r '.total')
+            if [ "$MAIL_COUNT" = "1" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Expected exactly one activation e-mail"
+          curl -fsS 'http://localhost:8025/api/v2/messages?limit=50'
+          exit 1
+
+      - name: Replay onboarding safely
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -sS -o /tmp/onboarding-replay.json -w '%{http_code}' \
+            -X POST http://localhost:8085/internal/onboardings \
+            -H "X-Internal-Key: $INTERNAL_API_KEY" \
+            -H "X-Onboarding-Id: $ONBOARDING_ID" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/onboarding.json)
+          test "$STATUS" = "200"
+          test "$(jq -r '.empresaId' /tmp/onboarding-replay.json)" = "$EMPRESA_ID"
+          test "$(jq -r '.masterUserId' /tmp/onboarding-replay.json)" = "$MASTER_ID"
+          test "$(jq -r '.contratoId' /tmp/onboarding-replay.json)" = "$CONTRATO_ID"
+
+          test "$(psql -h localhost -U postgres -d ps_empresa_it -Atc "SELECT count(*) FROM empresas WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_user_it -Atc "SELECT count(*) FROM usuarios WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_contrato_it -Atc "SELECT count(*) FROM contratos WHERE onboarding_id='$ONBOARDING_ID'")" = "1"
+          test "$(psql -h localhost -U postgres -d ps_login_it -Atc "SELECT count(*) FROM activation_tokens WHERE request_id='$ONBOARDING_ID'")" = "1"
+          test "$(curl -fsS 'http://localhost:8025/api/v2/messages?limit=50' | jq -r '.total')" = "1"
+
+      - name: Reject divergent replay
+        run: |
+          set -euo pipefail
+          jq '.nomeFantasia = "Nome Divergente"' /tmp/onboarding.json > /tmp/onboarding-conflict.json
+          STATUS=$(curl -sS -o /tmp/conflict-response.json -w '%{http_code}' \
+            -X POST http://localhost:8085/internal/onboardings \
+            -H "X-Internal-Key: $INTERNAL_API_KEY" \
+            -H "X-Onboarding-Id: $ONBOARDING_ID" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/onboarding-conflict.json)
+          test "$STATUS" = "409"
+          test "$(jq -r '.code' /tmp/conflict-response.json)" = "ONBOARDING_CONFLICT"
+          test "$(jq -r '.step' /tmp/conflict-response.json)" = "EMPRESA"
+          test "$(curl -fsS 'http://localhost:8025/api/v2/messages?limit=50' | jq -r '.total')" = "1"
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onboarding-integration-logs
+          path: |
+            ps-empresa.log
+            ps-user.log
+            ps-contrato.log
+            ps-login.log
+            ps-orchestrator.log
+          if-no-files-found: ignore
+
+      - name: Stop services
+        if: always()
+        run: |
+          test -f ps-orchestrator.pid && kill "$(cat ps-orchestrator.pid)" || true
+          test -f ps-login.pid && kill "$(cat ps-login.pid)" || true
+          test -f ps-contrato.pid && kill "$(cat ps-contrato.pid)" || true
+          test -f ps-user.pid && kill "$(cat ps-user.pid)" || true
+          test -f ps-empresa.pid && kill "$(cat ps-empresa.pid)" || true
