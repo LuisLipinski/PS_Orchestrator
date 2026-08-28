@@ -19,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.util.Locale;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -91,8 +92,12 @@ public class OnboardingService {
                 master.id(),
                 contrato.id(),
                 contrato.numeroContrato(),
-                contrato.statusName(),
+                toStatusCode(contrato.statusName()),
                 INVITATION_REQUESTED);
+    }
+
+    private String toStatusCode(String statusName) {
+        return statusName.trim().replace(' ', '_').toUpperCase(Locale.ROOT);
     }
 
     private <T> T call(UUID onboardingId, String step, Supplier<T> action) {
